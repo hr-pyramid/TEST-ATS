@@ -177,6 +177,7 @@
       <div class="uploader" id="uploader">
         <h3>Resume intake</h3>
         <p>Parse a resume to auto-fill fields, store the original in Drive, and score it against a job description.</p>
+        <input type="text" id="apiKey" placeholder="Gemini API key (X-goog-api-key)…" style="width:100%;margin-bottom:10px" oninput="localStorage.setItem('geminiKey',this.value)">
         <div class="file-row">
           <input type="file" id="resumeFile" accept=".pdf,.doc,.docx,.png,.jpg,.jpeg" onchange="onFilePicked()">
           <button class="act btn-dark" onclick="parseSelectedResume()">Parse &amp; store</button>
@@ -249,6 +250,7 @@
 
   window.onload = () => {
     ROLE = localStorage.getItem("portalRole") || "Recruiter";
+    const savedKey = localStorage.getItem("geminiKey"); if(savedKey){ const k=document.getElementById('apiKey'); if(k) k.value=savedKey; }
     document.getElementById('whoami').innerHTML =
       "Signed in as " + (localStorage.getItem("portalUser")||"user") + `<span class="role-badge">${ROLE}</span>`;
     if (ROLE.toLowerCase() === "viewer") document.querySelector('.tab.perm').style.display = "none";
@@ -418,6 +420,31 @@
   function toBase64(file){return new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(r.result.split(',')[1]);r.onerror=()=>rej(new Error("read failed"));r.readAsDataURL(file);});}
   function postJSON(p){return fetch(API_URL,{method:'POST',redirect:'follow',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify(p)}).then(r=>r.json());}
 
+  // ── Gemini called FROM THE BROWSER — same path your standalone parser uses (not via Apps Script). ──
+  const GEMINI_MODEL_C = "gemini-flash-latest";
+  async function gemini(parts){
+    const key=(document.getElementById('apiKey').value||localStorage.getItem('geminiKey')||'').trim();
+    if(!key) throw new Error("Enter your Gemini API key in the field at the top of this panel.");
+    const res=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL_C}:generateContent`,{
+      method:'POST', headers:{'Content-Type':'application/json','X-goog-api-key':key},
+      body:JSON.stringify({contents:[{parts}],generationConfig:{responseMimeType:"application/json",temperature:0.2}})
+    });
+    const j=await res.json();
+    if(!res.ok) throw new Error(j.error?.message || ("HTTP "+res.status));
+    return JSON.parse(j.candidates[0].content.parts[0].text);
+  }
+  const P_PARSE='Parse the resume and return ONLY JSON (empty string if a field is absent, no markdown): '
+    +'{"Candidate Name":"","Mail Id":"","Contact No":"","Designation":"","Department":"","Role":"","Source":"","Skills":"","Summary":""}. '
+    +'"Role"=most recent/senior title. "Designation"=current title. "Department"=function area. "Skills"=comma-separated. "Summary"=one sentence.';
+  const P_SCORE_ADDON=' Also append to the SAME JSON object: "score" (integer 0-100 match vs the JD), "verdict" (one short line), "strengths" (array of up to 4), "gaps" (array of up to 4).';
+  const P_SCORE='Score the resume against the JOB DESCRIPTION. Return ONLY JSON: {"score":0,"verdict":"","strengths":["",""],"gaps":["",""]}. "score"=integer 0-100. No markdown.';
+  const P_KIT='Build a first-round screening kit for the role/JD. Return ONLY JSON: {"questions":[{"q":"","focus":""}],"scorecard":[{"criterion":"","weight":""}]}. 6-8 role-specific questions each with a 1-3 word focus; 4-6 scorecard criteria with percentage weights summing to ~100%. No markdown.';
+
+  function buildParts(prompt, text, f, data){
+    return text ? [{text: prompt + "\n\nRESUME TEXT:\n" + text}]
+                : [{inline_data:{mime_type:f.type||"application/pdf", data:data}}, {text: prompt}];
+  }
+
   async function extractText(file){
     if(extractCache.name===file.name && extractCache.text) return extractCache.text;
     const buf = await file.arrayBuffer(); let text="";
@@ -449,18 +476,17 @@
     if(!f){st.style.color="#ef4444";st.innerText="Pick a resume file first.";return;}
     try{
       st.style.color="#4338ca";st.innerText="Reading document…";
-      const text=await extractText(f); const data=await toBase64(f);
+      const text=await extractText(f);
+      const data=text?null:await toBase64(f);             // only need base64 if no text layer
       const jd=(document.getElementById('jd').value||'').trim();
       st.innerText = jd ? "Parsing & scoring with AI…" : "Parsing with AI…";
-      // One combined call when a JD is present = half the quota; plain parse otherwise.
-      const payload = text ? {resumeText:text} : {fileData:data, mimeType:f.type||"application/pdf"};
-      payload.action = jd ? "parseAndScore" : "parseResume"; if(jd) payload.jobDescription=jd;
-      const r=await postJSON(payload);
-      if(r.status!=="success")throw new Error(r.message);
-      const p=r.data||{}; applyParsed(p);
+      const prompt = jd ? (P_PARSE + P_SCORE_ADDON + "\n\nJOB DESCRIPTION:\n" + jd) : P_PARSE;
+      const p = await gemini(buildParts(prompt, text, f, data));   // ← browser call
+      applyParsed(p);
       if(jd && p.score!==undefined) showScore(p);
       st.innerText="Saving original to Drive…";
-      const up=await postJSON({action:"uploadResume",fileData:data,mimeType:f.type||"application/pdf",fileName:f.name});
+      const driveData = data || await toBase64(f);
+      const up=await postJSON({action:"uploadResume",fileData:driveData,mimeType:f.type||"application/pdf",fileName:f.name});
       if(up.status==="success"&&up.link)document.getElementById('Resume').value=up.link;
       st.style.color="#16a34a";
       st.innerHTML=`Parsed & stored. ${up.link?'<a class="cv" href="'+up.link+'" target="_blank" style="color:var(--brand);font-weight:600">View CV ↗</a>':''} Review, then Register.`;
@@ -470,14 +496,13 @@
   async function scoreSelectedResume(){
     const f=document.getElementById('resumeFile').files[0]; const st=document.getElementById('scoreStatus');
     if(!f){st.style.color="#ef4444";st.innerText="Pick a resume file first.";return;}
+    const jd=(document.getElementById('jd').value||'').trim();
+    if(!jd){st.style.color="#ef4444";st.innerText="Paste a job description first.";return;}
     try{
       st.style.color="#4338ca";st.innerText="Scoring against JD…";
-      const text=await extractText(f); const data=await toBase64(f);
-      const payload = text ? {resumeText:text} : {fileData:data, mimeType:f.type||"application/pdf"};
-      payload.action="scoreResume"; payload.jobDescription=document.getElementById('jd').value||"";
-      const r=await postJSON(payload);
-      if(r.status!=="success")throw new Error(r.message);
-      showScore(r.data||{});
+      const text=await extractText(f); const data=text?null:await toBase64(f);
+      const d=await gemini(buildParts(P_SCORE + "\n\nJOB DESCRIPTION:\n" + jd, text, f, data));   // ← browser call
+      showScore(d);
       st.style.color="#16a34a";st.innerText="Scored — saved to the AI Score field.";
     }catch(err){console.error(err);st.style.color="#ef4444";st.innerText="Failed: "+err.message;}
   }
@@ -497,8 +522,8 @@
     const role=document.getElementById('kitRole').value;
     if(!role&&!document.getElementById('kitJd').value){st.style.color="#ef4444";st.innerText="Enter a role or JD first.";return;}
     try{ st.style.color="#4338ca";st.innerText="Building screening kit…"; out.innerHTML="";
-      const r=await postJSON({action:"generateKit",role:role,jobDescription:document.getElementById('kitJd').value||""});
-      if(r.status!=="success")throw new Error(r.message); const d=r.data||{};
+      const jd=document.getElementById('kitJd').value||"";
+      const d=await gemini([{text: P_KIT + "\n\nROLE: " + role + "\n\nJOB DESCRIPTION:\n" + jd}]);   // ← browser call
       out.innerHTML=`<h3 class="sec" style="margin-top:18px">Screening questions</h3>
         ${(d.questions||[]).map(q=>`<div class="kit-q"><div class="focus">${esc(q.focus||'general')}</div>${esc(q.q)}</div>`).join('')}
         <h3 class="sec" style="margin-top:18px">Scorecard</h3>
