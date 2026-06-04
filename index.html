@@ -4,6 +4,8 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>TalentPool ATS</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
 <script>
   if (localStorage.getItem("portalSession") !== "authenticated") window.location.href = "login.html";
 </script>
@@ -406,23 +408,57 @@
     else w.style.display='none';
   }
 
-  // resume parse / store / score
+  // resume parse / store / score  — text extracted in-browser (light on API quota)
+  if (window.pdfjsLib) pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.worker.min.js';
+  let extractCache = { name:null, text:null }; // avoid re-extracting for parse + score of same file
+
   function onFilePicked(){const f=document.getElementById('resumeFile').files[0];
+    extractCache={name:null,text:null};
     document.getElementById('parseStatus').innerHTML=f?`<span class="pill">${f.name} ready</span>`:'';}
   function toBase64(file){return new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(r.result.split(',')[1]);r.onerror=()=>rej(new Error("read failed"));r.readAsDataURL(file);});}
   function postJSON(p){return fetch(API_URL,{method:'POST',redirect:'follow',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify(p)}).then(r=>r.json());}
 
+  async function extractText(file){
+    if(extractCache.name===file.name && extractCache.text) return extractCache.text;
+    const buf = await file.arrayBuffer(); let text="";
+    if(file.name.toLowerCase().endsWith('.pdf')){
+      const pdf = await pdfjsLib.getDocument({data:buf}).promise;
+      for(let i=1;i<=pdf.numPages;i++){ const pg=await pdf.getPage(i); const c=await pg.getTextContent();
+        text += c.items.map(it=>it.str).join(" ")+"\n"; }
+    } else if(file.name.toLowerCase().endsWith('.docx')){
+      text = (await mammoth.extractRawText({arrayBuffer:buf})).value;
+    } else {
+      // images / scanned PDFs without a text layer: fall back to sending the file to the AI
+      return null;
+    }
+    if(!text.trim()) return null;          // scanned PDF with no text layer -> fallback
+    extractCache={name:file.name,text:text};
+    return text;
+  }
+
+  function applyParsed(p){
+    setVal("Candidate Name",p["Candidate Name"]);setVal("Mail Id",p["Mail Id"]);setVal("Contact No",p["Contact No"]);
+    setVal("Designation",p["Designation"]);setVal("Department",p["Department"]);setVal("Role",p["Role"]);
+    if(p["Source"])setVal("Source",p["Source"]);
+    const note=[p["Summary"],p["Skills"]?("Skills: "+p["Skills"]):""].filter(Boolean).join(" — "); if(note)setVal("Remarks",note);
+    checkDupe();
+  }
+
   async function parseSelectedResume(){
     const f=document.getElementById('resumeFile').files[0]; const st=document.getElementById('parseStatus');
     if(!f){st.style.color="#ef4444";st.innerText="Pick a resume file first.";return;}
-    try{ st.style.color="#4338ca";st.innerText="Parsing with AI…"; const data=await toBase64(f);
-      const r=await postJSON({action:"parseResume",fileData:data,mimeType:f.type||"application/pdf"});
-      if(r.status!=="success")throw new Error(r.message); const p=r.data||{};
-      setVal("Candidate Name",p["Candidate Name"]);setVal("Mail Id",p["Mail Id"]);setVal("Contact No",p["Contact No"]);
-      setVal("Designation",p["Designation"]);setVal("Department",p["Department"]);setVal("Role",p["Role"]);
-      if(p["Source"])setVal("Source",p["Source"]);
-      const note=[p["Summary"],p["Skills"]?("Skills: "+p["Skills"]):""].filter(Boolean).join(" — "); if(note)setVal("Remarks",note);
-      checkDupe();
+    try{
+      st.style.color="#4338ca";st.innerText="Reading document…";
+      const text=await extractText(f); const data=await toBase64(f);
+      const jd=(document.getElementById('jd').value||'').trim();
+      st.innerText = jd ? "Parsing & scoring with AI…" : "Parsing with AI…";
+      // One combined call when a JD is present = half the quota; plain parse otherwise.
+      const payload = text ? {resumeText:text} : {fileData:data, mimeType:f.type||"application/pdf"};
+      payload.action = jd ? "parseAndScore" : "parseResume"; if(jd) payload.jobDescription=jd;
+      const r=await postJSON(payload);
+      if(r.status!=="success")throw new Error(r.message);
+      const p=r.data||{}; applyParsed(p);
+      if(jd && p.score!==undefined) showScore(p);
       st.innerText="Saving original to Drive…";
       const up=await postJSON({action:"uploadResume",fileData:data,mimeType:f.type||"application/pdf",fileName:f.name});
       if(up.status==="success"&&up.link)document.getElementById('Resume').value=up.link;
@@ -430,20 +466,29 @@
       st.innerHTML=`Parsed & stored. ${up.link?'<a class="cv" href="'+up.link+'" target="_blank" style="color:var(--brand);font-weight:600">View CV ↗</a>':''} Review, then Register.`;
     }catch(err){console.error(err);st.style.color="#ef4444";st.innerText="Failed: "+err.message;}
   }
+
   async function scoreSelectedResume(){
     const f=document.getElementById('resumeFile').files[0]; const st=document.getElementById('scoreStatus');
     if(!f){st.style.color="#ef4444";st.innerText="Pick a resume file first.";return;}
-    try{ st.style.color="#4338ca";st.innerText="Scoring against JD…"; const data=await toBase64(f);
-      const r=await postJSON({action:"scoreResume",fileData:data,mimeType:f.type||"application/pdf",jobDescription:document.getElementById('jd').value||""});
-      if(r.status!=="success")throw new Error(r.message); const d=r.data||{};
-      setVal("AI Score",d.score); setVal("Score Notes",(d.verdict||"")+(d.gaps&&d.gaps.length?(" | Gaps: "+d.gaps.join("; ")):""));
-      const box=document.getElementById('scorebox'); box.style.display='block';
-      box.innerHTML=`<div class="scorehead"><div class="ring" style="background:${scoreColor(d.score)}">${d.score||0}</div>
-        <div><strong>${esc(d.verdict||'Assessed')}</strong><div class="hint" style="margin:0">AI match score vs job description</div></div></div>
-        <div class="cols2"><div><strong>Strengths</strong><ul>${(d.strengths||[]).map(x=>`<li>${esc(x)}</li>`).join('')||'<li>—</li>'}</ul></div>
-        <div><strong>Gaps</strong><ul>${(d.gaps||[]).map(x=>`<li>${esc(x)}</li>`).join('')||'<li>—</li>'}</ul></div></div>`;
+    try{
+      st.style.color="#4338ca";st.innerText="Scoring against JD…";
+      const text=await extractText(f); const data=await toBase64(f);
+      const payload = text ? {resumeText:text} : {fileData:data, mimeType:f.type||"application/pdf"};
+      payload.action="scoreResume"; payload.jobDescription=document.getElementById('jd').value||"";
+      const r=await postJSON(payload);
+      if(r.status!=="success")throw new Error(r.message);
+      showScore(r.data||{});
       st.style.color="#16a34a";st.innerText="Scored — saved to the AI Score field.";
     }catch(err){console.error(err);st.style.color="#ef4444";st.innerText="Failed: "+err.message;}
+  }
+
+  function showScore(d){
+    setVal("AI Score",d.score); setVal("Score Notes",(d.verdict||"")+(d.gaps&&d.gaps.length?(" | Gaps: "+d.gaps.join("; ")):""));
+    const box=document.getElementById('scorebox'); box.style.display='block';
+    box.innerHTML=`<div class="scorehead"><div class="ring" style="background:${scoreColor(d.score)}">${d.score||0}</div>
+      <div><strong>${esc(d.verdict||'Assessed')}</strong><div class="hint" style="margin:0">AI match score vs job description</div></div></div>
+      <div class="cols2"><div><strong>Strengths</strong><ul>${(d.strengths||[]).map(x=>`<li>${esc(x)}</li>`).join('')||'<li>—</li>'}</ul></div>
+      <div><strong>Gaps</strong><ul>${(d.gaps||[]).map(x=>`<li>${esc(x)}</li>`).join('')||'<li>—</li>'}</ul></div></div>`;
   }
 
   // interview kit
