@@ -275,7 +275,7 @@
   // duplicate detection
   function markDupes(){
     const seen={};
-    allData.forEach(r=>{ const k=((r["Mail Id"]||'')+'|'+(r["Contact No"]||'')).toLowerCase(); r.__dupe=false;
+    allData.forEach(r=>{ const k=(S(r["Mail Id"])+'|'+S(r["Contact No"])).toLowerCase(); r.__dupe=false;
       if(k!=='|'){ if(seen[k]) { r.__dupe=true; allData[seen[k]].__dupe=true; } else seen[k]=allData.indexOf(r); } });
   }
 
@@ -404,7 +404,7 @@
     const em=(document.getElementById('Mail Id').value||'').toLowerCase().trim();
     const ph=(document.getElementById('Contact No').value||'').trim();
     const cur=document.getElementById('rowNumber').value;
-    const hit=allData.find(r=>String(r.rowNumber)!==cur && ((em&&(r["Mail Id"]||'').toLowerCase().trim()===em)||(ph&&(r["Contact No"]||'').trim()===ph)));
+    const hit=allData.find(r=>String(r.rowNumber)!==cur && ((em&&S(r["Mail Id"]).toLowerCase().trim()===em)||(ph&&S(r["Contact No"]).trim()===ph)));
     const w=document.getElementById('dupeWarn');
     if(hit){ w.style.display='block'; w.innerText=`Possible duplicate: ${hit["Candidate Name"]||'existing record'} already has this email/phone (row ${hit.rowNumber}).`; }
     else w.style.display='none';
@@ -533,6 +533,7 @@
   }
 
   function scoreColor(s){s=parseInt(s)||0; return s>=75?'#16a34a':s>=50?'#f59e0b':'#ef4444';}
+  function S(v){return v==null?'':String(v);}   // sheet cells can be numbers/dates — coerce before string ops
   function setVal(id,v){const el=document.getElementById(id); if(el&&v!==undefined&&v!=='')el.value=v;}
   function esc(s){return s==null?'':String(s).replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));}
   function logout(){localStorage.removeItem("portalSession");localStorage.removeItem("portalUser");localStorage.removeItem("portalRole");window.location.href="login.html";}
