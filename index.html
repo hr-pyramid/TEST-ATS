@@ -177,7 +177,7 @@
       <div class="uploader" id="uploader">
         <h3>Resume intake</h3>
         <p>Parse a resume to auto-fill fields, store the original in Drive, and score it against a job description.</p>
-        <input type="text" id="apiKey" placeholder="Gemini API key (X-goog-api-key)…" style="width:100%;margin-bottom:10px" oninput="localStorage.setItem('geminiKey',this.value)">
+        <input type="text" id="apiKey" placeholder="Gemini key — optional, overrides the server key…" style="width:100%;margin-bottom:10px" oninput="localStorage.setItem('geminiKey',this.value)">
         <div class="file-row">
           <input type="file" id="resumeFile" accept=".pdf,.doc,.docx,.png,.jpg,.jpeg" onchange="onFilePicked()">
           <button class="act btn-dark" onclick="parseSelectedResume()">Parse &amp; store</button>
@@ -254,8 +254,19 @@
     document.getElementById('whoami').innerHTML =
       "Signed in as " + (localStorage.getItem("portalUser")||"user") + `<span class="role-badge">${ROLE}</span>`;
     if (ROLE.toLowerCase() === "viewer") document.querySelector('.tab.perm').style.display = "none";
-    setupDrag(); fetchData();
+    fetchConfig(); setupDrag(); fetchData();
   };
+  let REMOTE_KEY = "";   // key pulled from Apps Script Script Properties after login
+  function fetchConfig(){
+    fetch(`${API_URL}?action=getConfig`,{method:"GET",redirect:"follow"})
+      .then(r=>r.json()).then(res=>{
+        if(res.status==="success" && res.geminiKey){
+          REMOTE_KEY = res.geminiKey;
+          const k=document.getElementById('apiKey');
+          if(k && !k.value){ k.placeholder="Key loaded from server (Script Properties)"; }
+        }
+      }).catch(()=>{});
+  }
   const canEdit = () => ROLE.toLowerCase() !== "viewer";
   const showLoading = s => document.getElementById('loading').style.display = s?'block':'none';
   function sv(v,el){ document.querySelectorAll('.view').forEach(x=>x.classList.remove('active'));
@@ -423,8 +434,8 @@
   // ── Gemini called FROM THE BROWSER — same path your standalone parser uses (not via Apps Script). ──
   const GEMINI_MODEL_C = "gemini-flash-latest";
   async function gemini(parts){
-    const key=(document.getElementById('apiKey').value||localStorage.getItem('geminiKey')||'').trim();
-    if(!key) throw new Error("Enter your Gemini API key in the field at the top of this panel.");
+    const key=(document.getElementById('apiKey').value||REMOTE_KEY||localStorage.getItem('geminiKey')||'').trim();
+    if(!key) throw new Error("No Gemini key found. Set it in Apps Script ▸ Script Properties (GEMINI_KEY), or type one in the field above.");
     const res=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL_C}:generateContent`,{
       method:'POST', headers:{'Content-Type':'application/json','X-goog-api-key':key},
       body:JSON.stringify({contents:[{parts}],generationConfig:{responseMimeType:"application/json",temperature:0.2}})
